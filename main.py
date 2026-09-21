@@ -1,3 +1,7 @@
+import os
+
+from dotenv import load_dotenv
+
 from agent import (
     AgentState,
     node_query_understanding,
@@ -7,6 +11,8 @@ from agent import (
     node_generate_briefing,
     answer_question
 )
+
+load_dotenv()
 
 def run_agent(user_query: str) -> AgentState:
     state = AgentState(raw_query=user_query)
@@ -34,6 +40,12 @@ def main():
     print("=" * 60)
     print("     Autonomous arXiv Paper Digest & QA Agent")
     print("=" * 60)
+
+    # Fail fast: check this before running the (slow) pipeline instead of
+    # only discovering a missing key after downloading + parsing + embedding.
+    if not os.getenv("GEMINI_API_KEY"):
+        print("\nGEMINI_API_KEY is not set. Add it to your environment or a .env file, then try again.")
+        return
     
     query = input("\nEnter arXiv ID, paper URL, or research topic:\n> ").strip()
     if not query:

@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any
@@ -14,6 +15,22 @@ from dotenv import load_dotenv
 # Load environment variables from .env
 load_dotenv()
 
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# Reuse a single GenAI client instance across invocations
+_genai_client: Optional[genai.Client] = None
+
+
+def _get_genai_client() -> genai.Client:
+    global _genai_client
+    if _genai_client is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is not set in environment or .env file.")
+        _genai_client = genai.Client(api_key=api_key)
+    return _genai_client
+
+
 @dataclass
 class AgentState:
     raw_query: str                          # User's initial input
@@ -23,36 +40,34 @@ class AgentState:
     pdf_path: Optional[str] = None          # Local path to downloaded PDF
     extracted_text: str = ""                # Extracted text from PDF
     briefing: str = ""                      # Formatted Executive Briefing
-    vector_collection: Any = None           # Persistent Chroma collection reference
+    vector_collection: Any = None           # In-memory Chroma collection
     chat_history: List[Dict[str, str]] = field(default_factory=list)
     error: Optional[str] = None             # Error tracking
 
 
 # --- Helper: Resilient LLM Invocation ---
 def call_llm_with_retry(prompt: str) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set in environment or .env file.")
-        
-    client = genai.Client(api_key=api_key)
+    client = _get_genai_client()
     config = types.GenerateContentConfig(temperature=0.2)
-    
+
+    last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model="gemini-3.5-flash-lite",
+                model=GEMINI_MODEL,
                 contents=prompt,
                 config=config
             )
             if response and response.text:
                 return response.text.strip()
+            last_error = RuntimeError("Model returned an empty response.")
         except Exception as e:
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-                continue
-            raise RuntimeError(f"LLM generation failed: {str(e)}")
-            
-    raise RuntimeError("LLM request timed out after retries.")
+            last_error = e
+
+        if attempt < 2:
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(f"LLM request failed after retries: {last_error}")
 
 
 # --- Node 1: Query Understanding ---
@@ -71,8 +86,8 @@ def node_query_understanding(state: AgentState) -> AgentState:
 
 # --- Node 2 & 3: arXiv Retrieval & Selection ---
 def node_arxiv_retrieval(state: AgentState) -> AgentState:
-    client = arxiv.Client()
-    
+    client = arxiv.Client(num_retries=3)
+
     try:
         if state.query_type == "arxiv_id":
             search = arxiv.Search(id_list=[state.arxiv_id])
@@ -99,22 +114,25 @@ def node_arxiv_retrieval(state: AgentState) -> AgentState:
             "pdf_url": paper.pdf_url,
             "summary": paper.summary.replace("\n", " ").strip()
         }
-        
-        # Consistent destination path to prevent version suffix mismatch
-        state.pdf_path = "current_paper.pdf"
-        
-        # Download PDF
-        req = urllib.request.Request(
-            paper.pdf_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        )
-        with urllib.request.urlopen(req) as response, open(state.pdf_path, 'wb') as out_file:
-            out_file.write(response.read())
 
-        # Verify file presence and size
+        download_dir = tempfile.mkdtemp(prefix="arxiv_agent_")
+        target_path = os.path.join(download_dir, "current_paper.pdf")
+
+        # Handle both client.download_pdf and direct urllib download safely
+        try:
+            client.download_pdf(paper, dirpath=download_dir, filename="current_paper.pdf")
+            state.pdf_path = target_path
+        except (AttributeError, Exception):
+            req = urllib.request.Request(
+                paper.pdf_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            )
+            with urllib.request.urlopen(req) as response, open(target_path, "wb") as f:
+                f.write(response.read())
+            state.pdf_path = target_path
+
         if not os.path.exists(state.pdf_path) or os.path.getsize(state.pdf_path) == 0:
             state.error = "Downloaded PDF file is empty or missing."
-            return state
 
     except Exception as e:
         state.error = f"arXiv retrieval error: {str(e)}"
@@ -126,12 +144,12 @@ def node_arxiv_retrieval(state: AgentState) -> AgentState:
 def node_parse_pdf(state: AgentState) -> AgentState:
     if state.error or not state.pdf_path:
         return state
-        
+
+    doc = None
     try:
         doc = pymupdf.open(state.pdf_path)
         pages_text = [page.get_text() for page in doc]
         state.extracted_text = "\n".join(pages_text)
-        doc.close()
         
         print(f"    [debug] Extracted {len(state.extracted_text)} characters from {len(pages_text)} pages.")
         
@@ -139,12 +157,20 @@ def node_parse_pdf(state: AgentState) -> AgentState:
             state.error = "PDF extracted insufficient text (may be scanned or corrupted layout)."
     except Exception as e:
         state.error = f"PDF parsing failed: {str(e)}"
+    finally:
+        if doc is not None:
+            doc.close()
         
     return state
 
 
 # --- Node 5: Chunking & Vector DB (Chroma) ---
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    if not text:
+        return []
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
     chunks = []
     start = 0
     while start < len(text):
@@ -195,17 +221,18 @@ def node_generate_briefing(state: AgentState) -> AgentState:
         return state
         
     try:
-        context = f"Abstract: {state.paper_metadata.get('summary', '')}\n\n" + state.extracted_text[:6000]
+        meta = state.paper_metadata
+        context = f"Abstract: {meta.get('summary', '')}\n\n" + state.extracted_text[:6000]
         
         prompt = f"""
         You are an AI research briefing agent. Produce a structured executive briefing for the research paper below.
         Format your response in clean Markdown matching these sections:
         
-        # Executive Briefing: {state.paper_metadata['title']}
-        - **Authors:** {', '.join(state.paper_metadata['authors'])}
-        - **arXiv ID:** {state.paper_metadata['arxiv_id']}
-        - **Published:** {state.paper_metadata['published']}
-        - **Link:** {state.paper_metadata['pdf_url']}
+        # Executive Briefing: {meta.get('title', 'Untitled')}
+        - **Authors:** {', '.join(meta.get('authors', []))}
+        - **arXiv ID:** {meta.get('arxiv_id', 'N/A')}
+        - **Published:** {meta.get('published', 'N/A')}
+        - **Link:** {meta.get('pdf_url', 'N/A')}
         
         ### 1-Paragraph Plain-English Summary
         (Provide a clear summary explaining why this paper matters)
@@ -240,6 +267,8 @@ def node_generate_briefing(state: AgentState) -> AgentState:
 def answer_question(state: AgentState, user_query: str) -> str:
     if state.vector_collection is None:
         return "No vector collection available in state."
+    if not user_query.strip():
+        return "Please enter a question."
         
     try:
         # Retrieve top 6 chunks for broad context coverage
